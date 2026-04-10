@@ -1,6 +1,7 @@
 package ackhandler
 
 import (
+	"github.com/quic-go/quic-go/congestion"
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/wire"
@@ -8,6 +9,8 @@ import (
 
 // SentPacketHandler handles ACKs received for outgoing packets
 type SentPacketHandler interface {
+	// SetCongestionControl replaces the current congestion control algorithm.
+	SetCongestionControl(congestion.CongestionControl)
 	// SentPacket may modify the packet
 	SentPacket(t monotime.Time, pn, largestAcked protocol.PacketNumber, streamFrames []StreamFrame, frames []Frame, encLevel protocol.EncryptionLevel, ecn protocol.ECN, size protocol.ByteCount, isPathMTUProbePacket, isPathProbePacket bool)
 	// ReceivedAck processes an ACK frame.
