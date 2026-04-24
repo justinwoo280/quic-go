@@ -10,8 +10,18 @@ import (
 )
 
 const (
-	maxDatagramSendQueueLen = 32
-	maxDatagramRcvQueueLen  = 128
+	// VPN / connect-ip 数据面场景下，每个 IP 包都是一个 DATAGRAM frame，
+	// 32 包 ≈ 32 × 1.4KB = 45KB，对 10Gbps+ 下行只够顶住 36µs；
+	// TLS 握手 / YouTube 这类瞬时大并发场景会立刻把队列灌满，
+	// quic-go 的 Add() 在满时会阻塞调用方（连带 connect-ip-go.WritePacket
+	// → connect-ip-tunnel.session.WritePacket → server downlink goroutine 全卡死），
+	// 上层观感就是"小请求通、大请求挂死"。
+	//
+	// 4096 包 ≈ 5.7MB，足以吸收 ~100ms 的 10Gbps 下行突发，
+	// 同时仍远小于 quic-go 自己的 16MB+ stream window 内存上限，
+	// 不会带来显著内存压力（每条连接最大额外 ~6MB）。
+	maxDatagramSendQueueLen = 4096
+	maxDatagramRcvQueueLen  = 4096
 )
 
 type datagramQueue struct {
