@@ -87,12 +87,26 @@ type sentPacketHandler struct {
 
 	ignorePacketsBelow func(protocol.PacketNumber)
 
+	// ackedPackets / ackedPacketsInfo / lostPacketsInfo are reused across
+	// ReceivedAck calls to avoid per-call allocations. They MUST only be
+	// touched from the connection's run goroutine; SentPacketHandler does not
+	// itself synchronize them.
 	ackedPackets     []packetWithPacketNumber // to avoid allocations in detectAndRemoveAckedPackets
 	ackedPacketsInfo []congestionExt.AckedPacketInfo
 	lostPacketsInfo  []congestionExt.LostPacketInfo
+	// lastNotifiedLowestUnacked tracks the last value we passed to
+	// CongestionControlEx.OnPacketsLost. It lets us call OnPacketsLost only
+	// when the lowest unacked packet number actually advances, matching the
+	// quiche BBRv2 expectation (~once per RTT) instead of once per ACK
+	// frame, which would needlessly shrink the BandwidthSampler window.
+	// protocol.InvalidPacketNumber means "never notified yet".
+	lastNotifiedLowestUnacked protocol.PacketNumber
 
 	bytesInFlight protocol.ByteCount
 
+	// congestion holds the active SendAlgorithm. It is read on the hot path
+	// via getCongestionControl() (RLock) and replaced by SetCongestionControl
+	// (Lock); MigratedPath also takes Lock when swapping to the default Cubic.
 	congestion      congestion.SendAlgorithmWithDebugInfos
 	congestionMutex sync.RWMutex
 	rttStats   *utils.RTTStats
@@ -157,6 +171,7 @@ func NewSentPacketHandler(
 		perspective:                    pers,
 		qlogger:                        qlogger,
 		logger:                         logger,
+		lastNotifiedLowestUnacked:      protocol.InvalidPacketNumber,
 	}
 	if enableECN {
 		h.enableECN = true
@@ -461,14 +476,8 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 			putPacket(p.packet)
 		}
 	}
-	// Notify BBRv2 (CongestionControlEx) with full acked+lost packet info
-	if cex, ok := h.getCongestionControl().(congestion.SendAlgorithmEx); ok &&
-		(len(h.ackedPacketsInfo) != 0 || len(h.lostPacketsInfo) != 0) {
-		cex.OnCongestionEventEx(priorInFlight, rcvTime, h.ackedPacketsInfo, h.lostPacketsInfo)
-		if lowestUnacked := h.appDataPackets.history.LowestPacketNumber(); lowestUnacked != protocol.InvalidPacketNumber {
-			cex.OnPacketsLost(lowestUnacked)
-		}
-	}
+	// Notify BBRv2 (CongestionControlEx) with full acked+lost packet info.
+	h.notifyExtCongestion(priorInFlight, rcvTime, h.ackedPacketsInfo, h.lostPacketsInfo)
 	h.lostPacketsInfo = h.lostPacketsInfo[:0]
 
 	// detect spurious losses for application data packets, if the ACK was not reordered
@@ -913,13 +922,8 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		// Early retransmit or time loss detection
 		h.lostPacketsInfo = h.lostPacketsInfo[:0]
 		h.detectLostPackets(now, encLevel)
-		if cex, ok := h.getCongestionControl().(congestion.SendAlgorithmEx); ok && len(h.lostPacketsInfo) != 0 {
-			priorInFlight := h.bytesInFlight
-			cex.OnCongestionEventEx(priorInFlight, now, nil, h.lostPacketsInfo)
-			if lowestUnacked := h.appDataPackets.history.LowestPacketNumber(); lowestUnacked != protocol.InvalidPacketNumber {
-				cex.OnPacketsLost(lowestUnacked)
-			}
-		}
+		// nil acked slice signals "loss-only event" to notifyExtCongestion.
+		h.notifyExtCongestion(h.bytesInFlight, now, nil, h.lostPacketsInfo)
 		h.lostPacketsInfo = h.lostPacketsInfo[:0]
 		return nil
 	}
@@ -1167,7 +1171,11 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 	for pn := range h.appDataPackets.history.PathProbes() {
 		h.appDataPackets.history.RemovePathProbe(pn)
 	}
-	h.congestion = congestion.NewCubicSender(
+	// Path migration: reset to the default Cubic sender. Take the same lock
+	// SetCongestionControl uses, so the hot-path getCongestionControl() never
+	// observes a torn pointer. Also reset the OnPacketsLost dedup state, since
+	// the new algorithm starts with no notification history.
+	newCC := congestion.NewCubicSender(
 		congestion.DefaultClock{},
 		h.rttStats,
 		h.connStats,
@@ -1175,6 +1183,10 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 		true, // use Reno
 		h.qlogger,
 	)
+	h.congestionMutex.Lock()
+	h.congestion = newCC
+	h.lastNotifiedLowestUnacked = protocol.InvalidPacketNumber
+	h.congestionMutex.Unlock()
 	h.setLossDetectionTimer(now)
 }
 
@@ -1185,8 +1197,57 @@ func (h *sentPacketHandler) getCongestionControl() congestion.SendAlgorithmWithD
 	return cc
 }
 
+// notifyExtCongestion forwards the current ACK/loss batch to the active
+// congestion controller if it implements the extended (BBRv2-style) interface.
+//
+// Two important details:
+//
+//   - It is a no-op when there are no acked packets and no lost packets, so
+//     it's safe to call unconditionally from any code path.
+//   - OnPacketsLost is only invoked when the lowest unacked packet number has
+//     advanced since the previous notification. quiche's BBRv2 uses this signal
+//     to garbage-collect old packet samples, expecting it ~once per RTT;
+//     calling it once per ACK frame (the previous behavior) shortens the
+//     BandwidthSampler window and degrades bandwidth estimates.
+func (h *sentPacketHandler) notifyExtCongestion(
+	priorInFlight protocol.ByteCount,
+	eventTime monotime.Time,
+	acked []congestionExt.AckedPacketInfo,
+	lost []congestionExt.LostPacketInfo,
+) {
+	if len(acked) == 0 && len(lost) == 0 {
+		return
+	}
+	cex, ok := h.getCongestionControl().(congestion.SendAlgorithmEx)
+	if !ok {
+		return
+	}
+	cex.OnCongestionEventEx(priorInFlight, eventTime, acked, lost)
+	lowestUnacked := h.appDataPackets.history.LowestPacketNumber()
+	if lowestUnacked == protocol.InvalidPacketNumber {
+		return
+	}
+	if h.lastNotifiedLowestUnacked == protocol.InvalidPacketNumber ||
+		lowestUnacked > h.lastNotifiedLowestUnacked {
+		cex.OnPacketsLost(lowestUnacked)
+		h.lastNotifiedLowestUnacked = lowestUnacked
+	}
+}
+
 // SetCongestionControl replaces the current congestion control algorithm.
-// It is safe to call this method concurrently with other methods.
+//
+// Concurrency: this call is goroutine-safe with respect to the hot path,
+// thanks to congestionMutex; getCongestionControl() always observes either
+// the old or the new pointer atomically.
+//
+// Lifecycle: this should be called at most once per *Conn, immediately after
+// the QUIC handshake completes and before any application data is sent.
+// Calling it after packets have been sent and acknowledged means the new
+// algorithm receives ACKs / losses for packets it never sent, which corrupts
+// BandwidthSampler-based estimators (BBR/BBRv2) and produces nonsensical
+// initial bandwidth values. The caller is responsible for honoring this; the
+// quic-go core does not attempt to "warm-start" the new algorithm with the
+// current bytes_in_flight.
 func (h *sentPacketHandler) SetCongestionControl(cc congestionExt.CongestionControl) {
 	h.congestionMutex.Lock()
 	cc.SetRTTStatsProvider(h.rttStats)
@@ -1195,5 +1256,8 @@ func (h *sentPacketHandler) SetCongestionControl(cc congestionExt.CongestionCont
 	} else {
 		h.congestion = &ccAdapter{cc}
 	}
+	// Reset the OnPacketsLost dedup state; the new algorithm has never been
+	// notified of any lowest-unacked value yet.
+	h.lastNotifiedLowestUnacked = protocol.InvalidPacketNumber
 	h.congestionMutex.Unlock()
 }
